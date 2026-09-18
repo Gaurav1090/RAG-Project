@@ -10,6 +10,8 @@ bundle:
 variables:
   catalog_name:
     description: Unity Catalog catalog this target's jobs operate against
+  vector_search_endpoint_name:
+    description: Vector Search endpoint this target's policy_chunks index is served from
 
 include:
   - resources/*.yml
@@ -21,9 +23,11 @@ targets:
       host: https://dbc-3f2f8026-e096.cloud.databricks.com
     variables:
       catalog_name: credit_platform
+      vector_search_endpoint_name: credit_platform_dev
 
   prod:
     workspace:
       host: https://dbc-3f2f8026-e096.cloud.databricks.com
     variables:
       catalog_name: credit_platform_prod
+      vector_search_endpoint_name: credit_platform_prod

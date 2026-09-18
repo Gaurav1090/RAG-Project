@@ -17,6 +17,32 @@ resources:
         project: credit_platform
         environment: ${bundle.target}
 
+    phase2_policy_intelligence_job:
+      name: ${bundle.target}_phase2_policy_intelligence
+      description: >-
+        Authors the dummy policy PDFs + committee memos and uploads them to
+        the policy Volumes, then parses them with ai_parse_document, chunks
+        the policy text into gold.policy_chunks, builds gold.committee_memos,
+        and creates/syncs the Vector Search Delta Sync index over
+        gold.policy_chunks. Re-runnable.
+      tasks:
+        - task_key: generate_policy_documents
+          notebook_task:
+            notebook_path: ../data_generation/02_generate_policy_documents.py
+            base_parameters:
+              catalog_name: ${var.catalog_name}
+        - task_key: ingest_policy_and_memos
+          depends_on:
+            - task_key: generate_policy_documents
+          notebook_task:
+            notebook_path: ../pipelines/policy_ingestion.py
+            base_parameters:
+              catalog_name: ${var.catalog_name}
+              vector_search_endpoint_name: ${var.vector_search_endpoint_name}
+      tags:
+        project: credit_platform
+        environment: ${bundle.target}
+
     phase1_foundation_job:
       name: ${bundle.target}_phase1_foundation
       description: >-

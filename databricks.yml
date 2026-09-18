@@ -1,0 +1,29 @@
+bundle:
+  name: credit_platform
+
+# One workspace, two Unity Catalog catalogs: `credit_platform` (dev) and
+# `credit_platform_prod` (prod). Both catalogs must already exist — Databricks
+# Free Edition's Default Storage catalogs can only be created via the UI, not
+# this bundle. Everything else (schemas, volumes, jobs, notebooks) is created
+# and kept in sync by deploying this bundle to each target.
+
+variables:
+  catalog_name:
+    description: Unity Catalog catalog this target's jobs operate against
+
+include:
+  - resources/*.yml
+
+targets:
+  dev:
+    default: true
+    workspace:
+      host: https://dbc-3f2f8026-e096.cloud.databricks.com
+    variables:
+      catalog_name: credit_platform
+
+  prod:
+    workspace:
+      host: https://dbc-3f2f8026-e096.cloud.databricks.com
+    variables:
+      catalog_name: credit_platform_prod

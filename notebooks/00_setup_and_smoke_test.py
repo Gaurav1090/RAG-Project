@@ -2,15 +2,19 @@
 # MAGIC %md
 # MAGIC # Phase 0 — Workspace & Repo Bootstrap: Setup + Smoke Test
 # MAGIC
-# MAGIC Run this once the `credit_platform` catalog exists (created via the Catalog Explorer UI,
-# MAGIC since Databricks Free Edition's Default Storage catalogs can't be created via API/CLI).
+# MAGIC Run this once the target catalog exists (created via the Catalog Explorer UI, since
+# MAGIC Databricks Free Edition's Default Storage catalogs can't be created via API/CLI).
 # MAGIC
 # MAGIC This notebook creates the five schemas, two policy volumes, and proves read/write access
 # MAGIC with a throwaway Delta table — the Phase 0 exit criterion from `Phased Implementation Plan & LLD.md`.
+# MAGIC
+# MAGIC Catalog name is a parameter so the same notebook runs unchanged against dev
+# MAGIC (`credit_platform`) and prod (`credit_platform_prod`) — see `resources/jobs.yml`.
 
 # COMMAND ----------
 
-CATALOG = "credit_platform"
+dbutils.widgets.text("catalog_name", "credit_platform", "Target catalog")
+CATALOG = dbutils.widgets.get("catalog_name")
 
 spark.sql(f"USE CATALOG {CATALOG}")
 
@@ -50,7 +54,7 @@ result = spark.table(f"{CATALOG}.bronze._phase0_smoke_test")
 display(result)
 
 assert result.count() == 2, "Smoke test failed: expected 2 rows"
-print("Phase 0 exit criterion met: catalog, schemas, volumes, and Delta read/write all working.")
+print(f"Phase 0 exit criterion met for catalog '{CATALOG}': schemas, volumes, and Delta read/write all working.")
 
 # COMMAND ----------
 

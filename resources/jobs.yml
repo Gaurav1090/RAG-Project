@@ -1,0 +1,18 @@
+resources:
+  jobs:
+    phase0_setup_job:
+      name: ${bundle.target}_phase0_setup
+      description: >-
+        Creates the bronze/silver/gold/policy/ops schemas and the policy_pdfs /
+        committee_memos volumes in the target catalog, then proves Delta
+        read/write access with a throwaway table. Re-runnable — every step is
+        idempotent (CREATE ... IF NOT EXISTS).
+      tasks:
+        - task_key: setup_and_smoke_test
+          notebook_task:
+            notebook_path: ../notebooks/00_setup_and_smoke_test.py
+            base_parameters:
+              catalog_name: ${var.catalog_name}
+      tags:
+        project: credit_platform
+        environment: ${bundle.target}

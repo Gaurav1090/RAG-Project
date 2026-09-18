@@ -85,7 +85,8 @@ Maps to Section 13, Phase 2.
 | | |
 |---|---|
 | **Goal** | Policy documents are parsed, versioned by effective date, chunked, embedded, and also distilled into a structured, machine-evaluable rules table; a separate qualitative corpus (committee memos) is parsed and made available to the new Advisory Pass |
-| **Tasks** | Author 3–5 dummy policy documents as PDFs (general SME credit policy, textile-sector policy v1, textile-sector policy v2/revised circular, one unrelated-sector policy as a negative-retrieval control); land them in the `policy_pdfs` Volume with metadata sidecar files; build a DLT pipeline: `ai_parse_document` → metadata extraction (`doc_type`, `effective_date`, `supersedes`, `applicable_sector`, `approval_status`) → chunking → human-validated structured rule extraction; create `gold.policy_chunks` and `gold.policy_rules`; build the Vector Search index over `policy_chunks`; implement UC Function `retrieve_policy`. **New:** author 6–10 dummy credit-committee memos (short qualitative notes — sector commentary, promoter conduct observations, one memo referencing Meera Textiles) as PDFs/text, land them in `committee_memos/` Volume, parse via the same `ai_parse_document` step tagged `doc_type='committee_memo'`, and land the result in `gold.committee_memos` (no rule extraction, no vector index — the Advisory Pass reads these directly); implement UC Function `get_committee_memos` |
+| **Tasks** | `data_generation/02_generate_policy_documents.py`: generate 4 dummy policy PDFs (general SME policy, textile circular v1, textile circular v2 revised, pharma sector policy as a negative-retrieval control) with `reportlab`, upload to the `policy_pdfs` Volume, write their manifest to `bronze.raw_policy_documents`, and seed `gold.policy_rules` directly from the same authored ground truth (see note below); also generate 7 committee memo PDFs, upload to `committee_memos/`, manifest to `bronze.raw_committee_memo_manifest`. `pipelines/policy_ingestion.py`: parse every PDF with `ai_parse_document`, chunk policy docs into `gold.policy_chunks` (one chunk per parsed title/paragraph element) and memos into `gold.committee_memos` (one row per memo, no chunking), then create/sync a Vector Search Delta Sync index over `policy_chunks`. UC Functions `retrieve_policy` and `get_committee_memos` are registered in a follow-up notebook once the index is queryable. **Simplification, stated plainly:** `gold.policy_rules` is authored directly alongside the PDF text rather than produced by a separate AI extraction step — for synthetic ground truth we already know exactly, running an LLM to re-extract what we just wrote would add fragility without adding fidelity. `ai_parse_document` is genuinely used for the unstructured text → chunks path, which is the part of Section 5's pipeline this project actually needs to demonstrate. |
+| **Real constraint hit and worked around** | Spark's `binaryFile` datasource / `read_files` table-valued function cannot see Unity Catalog Volume files on this workspace's serverless job compute — `spark.read.format("binaryFile").load("/Volumes/...")` returns 0 rows even though `dbutils.fs.ls` and plain Python `open()` on the identical path both work. `policy_ingestion.py` reads each file with `open(path, "rb")` and hands the bytes to `ai_parse_document` via a one-row DataFrame instead of bulk-loading the volume. Also: this project needed its own Vector Search endpoints (`credit_platform_dev`, `credit_platform_prod`) rather than reusing a pre-existing unrelated one already in the workspace. |
 | **Dummy data scope** | The pre/post-circular pair is mandatory: `POLICY-TEXTILE-01` (v1, effective 2026-01-01) and `POLICY-TEXTILE-01-v2` (effective 2026-09-01, supersedes v1, raises DSCR threshold) — this pair is what makes the Section 3 narrative hook work. For memos: at least one memo dated pre-circular with no qualitative concerns, and one dated post-circular noting softening sector export volumes — mirroring the two demo outputs in Section 9 |
 | **Deliverable** | Working `retrieve_policy(query, sector, as_of_date)` that returns only the version effective as of `as_of_date`; `policy_rules` table with the DSCR-001-style structured rules; working `get_committee_memos(sector, borrower_id)` returning memo text + date |
 | **Exit criterion** | `retrieve_policy("DSCR threshold textile", as_of="2026-08-01")` returns v1; same call with `as_of="2026-09-15"` returns v2, and never both. `get_committee_memos("textile_msme")` returns the seeded memos, most recent first |
@@ -139,10 +140,12 @@ RAG-Project/
 ├── Credit Decision Support & Policy Intelligence Platform.md   # business case + HLD (existing)
 ├── Phased Implementation Plan & LLD.md                          # this file
 ├── data_generation/
-│   ├── 00_generate_dummy_data.py        # synthetic bronze -> silver -> gold data
-│   └── 01_register_uc_functions.py      # registers the 4 Phase-1 UC Functions
+│   ├── 00_generate_dummy_data.py           # synthetic bronze -> silver -> gold data
+│   ├── 01_register_uc_functions.py        # registers the 4 Phase-1 UC Functions
+│   ├── 02_generate_policy_documents.py    # authors + uploads policy/memo PDFs, seeds policy_rules
+│   └── 03_register_policy_functions.py    # registers retrieve_policy + get_committee_memos
 ├── pipelines/
-│   ├── policy_ingestion_dlt.py          # DLT: PDF -> parsed -> chunked -> gold
+│   ├── policy_ingestion.py              # ai_parse_document -> chunk -> gold.policy_chunks/committee_memos + VS index
 │   └── data_refresh_job.py              # scheduled bronze->silver->gold refresh
 ├── engine/
 │   ├── rule_loader.py
@@ -307,11 +310,12 @@ All monetary columns are `DOUBLE` in the actual implementation (not `DECIMAL`) �
 | assessment_date | DATE |
 | requested_loan_amount | DOUBLE |
 
-**`gold.policy_rules`** — mirrors Section 5's example exactly:
+**`gold.policy_rules`** — same fields as Section 5's example, with one addition made during implementation: `rule_id` (e.g. `DSCR-001`) repeats across policy versions and even across sectors (the pharma negative-control document also defines its own `DSCR-001` at a different threshold), so it can't be the table's primary key on its own. `rule_uid` is the actual PK; `rule_id` stays the stable, version-independent label the rules engine (Phase 3) returns in its output, matching Section 7 exactly.
 
 | Column | Type |
 |---|---|
-| rule_id | STRING (PK) |
+| rule_uid | STRING (PK) — e.g. `POLICY-TEXTILE-01-v2-DSCR-001` |
+| rule_id | STRING — e.g. `DSCR-001`, stable across versions |
 | metric | STRING |
 | operator | STRING |
 | threshold | DOUBLE |

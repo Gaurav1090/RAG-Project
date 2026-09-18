@@ -73,9 +73,9 @@ Maps to Section 13, Phase 1 — expanded.
 | | |
 |---|---|
 | **Goal** | All structured "ground truth" data the rules engine and agent will query exists as governed Delta tables |
-| **Tasks** | Write a `Faker`-based generator notebook (`00_generate_dummy_data.py`) producing: borrowers, financial statements, CIBIL reports, CRILC/wilful-defaulter records, cross-bank exposure, promoter/guarantor records, internal product history (cards/OD/loans); load as bronze → validate/type → silver; build `gold.borrower_360` as a wide, query-ready view/table; define UC Functions (`get_borrower_financials`, `get_cibil_report`, `check_repeat_offender_signals`, `get_promoter_financials`) per the LLD table schemas in Part D |
-| **Dummy data scope** | ~200 synthetic borrowers, weighted so ~70% "clean," ~15% borderline (SMA-1-like), ~10% delinquent/NPA, ~5% flagged repeat-offender; include the fixed reference borrower **Meera Textiles (MT-2026-0142)** exactly as specified in Section 3, so the demo scenario is reproducible on top of the random pool |
-| **Deliverable** | Populated `bronze`/`silver`/`gold` schemas; 4 working UC Functions callable from SQL and Python; a data dictionary (table of column → meaning → source table) |
+| **Tasks** | Write a generator notebook (`data_generation/00_generate_dummy_data.py`) producing: borrowers, financial statements, CIBIL reports, CRILC/wilful-defaulter records, cross-bank exposure, promoter/guarantor records, internal product history (cards/OD/loans); load as bronze → validate/type → silver; build `gold.borrower_360` and seed `gold.applications` with the reference application; register the 4 UC Functions in a second notebook (`data_generation/01_register_uc_functions.py`) per the LLD table/function schemas in Part D. Both notebooks run as tasks in one bundle job (`resources/jobs.yml`), deployed and run against both `credit_platform` (dev) and `credit_platform_prod` (prod), matching Phase 0's pattern |
+| **Dummy data scope** | ~200 synthetic borrowers, weighted so ~70% "clean," ~15% borderline (SMA-1-like), ~10% delinquent/NPA, ~5% flagged repeat-offender; include the fixed reference borrower **Meera Textiles (MT-2026-0142)** exactly as specified in Section 3, so the demo scenario is reproducible on top of the random pool. Generation uses a fixed random seed so both environments end up with the identical synthetic pool |
+| **Deliverable** | Populated `bronze`/`silver`/`gold` schemas in both catalogs; 4 working UC Functions callable from SQL and Python; a data dictionary (Part D.2) |
 | **Exit criterion** | Given `MT-2026-0142`, `get_borrower_financials()` returns the exact values in Section 3's reference table |
 
 ### Phase 2 — Policy Intelligence Pipeline (4–6 days)
@@ -139,7 +139,8 @@ RAG-Project/
 ├── Credit Decision Support & Policy Intelligence Platform.md   # business case + HLD (existing)
 ├── Phased Implementation Plan & LLD.md                          # this file
 ├── data_generation/
-│   └── 00_generate_dummy_data.py        # Faker-based synthetic data, writes bronze
+│   ├── 00_generate_dummy_data.py        # synthetic bronze -> silver -> gold data
+│   └── 01_register_uc_functions.py      # registers the 4 Phase-1 UC Functions
 ├── pipelines/
 │   ├── policy_ingestion_dlt.py          # DLT: PDF -> parsed -> chunked -> gold
 │   └── data_refresh_job.py              # scheduled bronze->silver->gold refresh
@@ -203,24 +204,108 @@ credit_platform (catalog)
 
 ### D.2 Core table schemas
 
-**`gold.borrower_360`**
+#### Phase 1 source schemas (bronze → silver, identical shape; silver adds PK dedupe + not-null filtering)
+
+All monetary columns are `DOUBLE` in the actual implementation (not `DECIMAL`) — simpler to generate and join in PySpark for a synthetic-data project; revisit only if real currency-precision requirements appear later.
+
+**`bronze.raw_borrowers` → `silver.borrowers`** (PK: `borrower_id`)
+
+| Column | Type |
+|---|---|
+| borrower_id | STRING |
+| legal_name | STRING |
+| sector | STRING |
+| annual_turnover | DOUBLE |
+| pan | STRING — company PAN, joins to `cibil_reports.pan` for the business bureau report |
+| city | STRING |
+| owner_ids | ARRAY<STRING> |
+| no_internal_history | BOOLEAN |
+| relationship_start_date | DATE |
+
+**`bronze.raw_financial_statements` → `silver.financial_statements`** (PK: `borrower_id`, `statement_date`)
+
+| Column | Type |
+|---|---|
+| borrower_id | STRING |
+| statement_date | DATE |
+| dscr | DOUBLE |
+| days_past_due | INT |
+| existing_exposure | DOUBLE |
+| collateral_value | DOUBLE |
+
+**`bronze.raw_cibil_reports` → `silver.cibil_reports`** (PK: `pan`)
+
+| Column | Type |
+|---|---|
+| pan | STRING |
+| borrower_id | STRING |
+| cibil_score | INT |
+| active_accounts | INT |
+| delinquency_flag | BOOLEAN |
+| enquiry_count | INT |
+| report_date | DATE |
+
+**`bronze.raw_crilc_records` → `silver.crilc_records`** (PK: `borrower_id`)
+
+| Column | Type |
+|---|---|
+| borrower_id | STRING |
+| crilc_flag | BOOLEAN |
+| wilful_defaulter_flag | BOOLEAN |
+| cross_bank_exposure | DOUBLE |
+| reporting_date | DATE |
+
+**`bronze.raw_internal_product_history` → `silver.internal_product_history`** (PK: `borrower_id`, `product_type`, `product_open_date`)
+
+| Column | Type |
+|---|---|
+| borrower_id | STRING |
+| product_type | STRING — `credit_card` / `overdraft` / `term_loan` |
+| missed_payment_flag | BOOLEAN |
+| days_past_due | INT |
+| product_open_date | DATE |
+
+**`bronze.raw_promoter_records` → `silver.promoter_records`** (PK: `owner_id`)
+
+| Column | Type |
+|---|---|
+| owner_id | STRING |
+| borrower_id | STRING |
+| name | STRING |
+| pan | STRING |
+| individual_cibil_score | INT |
+| other_business_interests | STRING — free text, empty when none |
+| guarantor_flag | BOOLEAN |
+| exposure_elsewhere | DOUBLE |
+
+**`gold.borrower_360`** — built by joining the six silver tables above on `borrower_id` (and `pan` for the CIBIL join)
 
 | Column | Type | Notes |
 |---|---|---|
 | borrower_id | STRING (PK) | e.g. `MT-2026-0142` |
 | legal_name | STRING | |
 | sector | STRING | e.g. `textile_msme` |
-| annual_turnover | DECIMAL(18,2) | |
+| annual_turnover | DOUBLE | |
 | dscr | DOUBLE | latest computed DSCR |
 | days_past_due | INT | |
-| existing_exposure | DECIMAL(18,2) | |
-| collateral_value | DECIMAL(18,2) | |
+| existing_exposure | DOUBLE | |
+| collateral_value | DOUBLE | |
 | cibil_score | INT | nullable → drives `missing_information` |
 | crilc_flag | BOOLEAN | |
 | wilful_defaulter_flag | BOOLEAN | |
 | no_internal_history | BOOLEAN | true for new-to-bank borrowers (Section 8.1) |
 | owner_ids | ARRAY<STRING> | promoter/guarantor IDs |
 | data_as_of | DATE | freshness field surfaced in output Section 9.2 |
+
+**`gold.applications`** (PK: `application_id`) — seeded in Phase 1 with the single reference application `APP-001` (Section 7); more rows arrive with Phase 3's golden test set
+
+| Column | Type |
+|---|---|
+| application_id | STRING |
+| borrower_id | STRING |
+| product | STRING |
+| assessment_date | DATE |
+| requested_loan_amount | DOUBLE |
 
 **`gold.policy_rules`** — mirrors Section 5's example exactly:
 

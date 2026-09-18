@@ -16,3 +16,28 @@ resources:
       tags:
         project: credit_platform
         environment: ${bundle.target}
+
+    phase1_foundation_job:
+      name: ${bundle.target}_phase1_foundation
+      description: >-
+        Generates the ~200-borrower synthetic pool (bronze -> silver -> gold,
+        including the fixed Meera Textiles reference borrower and the APP-001
+        reference application), then registers the 4 Phase-1 UC Functions.
+        Re-runnable — data generation uses a fixed random seed and every write
+        is overwrite/CREATE OR REPLACE.
+      tasks:
+        - task_key: generate_dummy_data
+          notebook_task:
+            notebook_path: ../data_generation/00_generate_dummy_data.py
+            base_parameters:
+              catalog_name: ${var.catalog_name}
+        - task_key: register_uc_functions
+          depends_on:
+            - task_key: generate_dummy_data
+          notebook_task:
+            notebook_path: ../data_generation/01_register_uc_functions.py
+            base_parameters:
+              catalog_name: ${var.catalog_name}
+      tags:
+        project: credit_platform
+        environment: ${bundle.target}

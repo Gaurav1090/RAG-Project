@@ -56,6 +56,27 @@ resources:
         project: credit_platform
         environment: ${bundle.target}
 
+    phase3_rules_engine_job:
+      name: ${bundle.target}_phase3_rules_engine
+      description: >-
+        Runs the pure-Python deterministic rules engine (engine/) against real
+        gold.applications / gold.borrower_360 / gold.policy_rules data for
+        APP-001, and writes the result to ops.assessment_results. The engine's
+        own correctness is proven locally by engine/tests/test_golden_cases.py
+        (no Databricks dependency); this job proves the same engine also works
+        end-to-end against the live catalog. Re-runnable — appends a new row
+        to ops.assessment_results each run rather than overwriting history.
+      tasks:
+        - task_key: run_assessment
+          notebook_task:
+            notebook_path: ../pipelines/run_assessment.py
+            base_parameters:
+              catalog_name: ${var.catalog_name}
+              application_id: APP-001
+      tags:
+        project: credit_platform
+        environment: ${bundle.target}
+
     phase1_foundation_job:
       name: ${bundle.target}_phase1_foundation
       description: >-

@@ -98,9 +98,9 @@ Maps to Section 13, Phase 3.
 | | |
 |---|---|
 | **Goal** | A pure Python/PySpark engine that takes an application + resolved policy version and deterministically returns eligibility — no LLM in this phase at all |
-| **Tasks** | Implement `RuleLoader`, `MetricCalculator`, `PolicyEvaluator`, `ResultBuilder` (see LLD Part D); wire inputs from Phase 1 UC Functions and policy version from Phase 2's `policy_rules`; write the golden test set (Section 11's 10 cases) as parametrized unit tests |
-| **Dummy data scope** | Reuse Phase 1 pool; add specifically-constructed edge-case applications for each of the 10 golden cases (e.g., a synthetic application with `dscr=1.15` against `POLICY-TEXTILE-01-v2` to force `manual_review`) |
-| **Deliverable** | Installable engine (notebook-based or a small wheel) producing the exact JSON output shape in Section 7; passing golden test suite |
+| **Tasks** | `engine/rule_loader.py`, `metric_calculator.py`, `policy_evaluator.py`, `result_builder.py`: plain Python, zero Spark/Databricks dependency (see LLD Part D.4) — a deliberate design choice that let all 10 golden cases run and pass as local `unittest` tests (`engine/tests/test_golden_cases.py`, `python3 -m unittest engine.tests.test_golden_cases`) with no Databricks round-trip at all. `pipelines/run_assessment.py`: a thin Databricks-side adapter that fetches a real application from `gold.applications`, a borrower via the Phase-1 `get_borrower_financials`/`check_repeat_offender_signals` UC Functions, and rules from `gold.policy_rules` joined to `bronze.raw_policy_documents.version`, feeds them to the same pure engine, and appends the result to `ops.assessment_results` — proving the engine also works end-to-end against live data, not just in isolation |
+| **Dummy data scope** | The 10 golden cases are synthetic dicts constructed directly in the test file (no catalog dependency for correctness) — reusing Meera Textiles' exact Section 3 values only for case 10, the pre/post-circular centerpiece. The live-data wiring (`run_assessment.py`) reuses Phase 1/2's already-seeded `APP-001` |
+| **Deliverable** | `engine/` as an importable, dependency-free Python package producing the exact JSON output shape in Section 7; all 10 golden cases + a dedicated determinism test (same input, 5 repeated calls, byte-identical output) passing locally; `ops.assessment_results` populated with a real, byte-for-byte match to Section 7's documented example for `APP-001` in both dev and prod |
 | **Exit criterion** | All 10 golden cases pass with a **deterministic, reproducible** status (same input → same output across repeated runs) |
 
 ### Phase 4 — Agent / Orchestration Layer (4–6 days)
@@ -146,13 +146,14 @@ RAG-Project/
 │   └── 03_register_policy_functions.py    # registers retrieve_policy + get_committee_memos
 ├── pipelines/
 │   ├── policy_ingestion.py              # ai_parse_document -> chunk -> gold.policy_chunks/committee_memos + VS index
+│   ├── run_assessment.py                # wires engine/ to live catalog data, writes ops.assessment_results
 │   └── data_refresh_job.py              # scheduled bronze->silver->gold refresh
-├── engine/
+├── engine/                               # pure Python, no Spark/Databricks dependency
 │   ├── rule_loader.py
 │   ├── metric_calculator.py
 │   ├── policy_evaluator.py
 │   ├── result_builder.py
-│   └── tests/test_golden_cases.py
+│   └── tests/test_golden_cases.py       # `python3 -m unittest engine.tests.test_golden_cases`
 ├── agent/
 │   ├── state.py                         # LangGraph state schema
 │   ├── nodes.py                         # one function per state in Section 6
@@ -349,7 +350,19 @@ All monetary columns are `DOUBLE` in the actual implementation (not `DECIMAL`) �
 | memo_text | STRING | parsed, human-readable qualitative note |
 | source_document_id | STRING | |
 
-**`ops.assessment_results`** and **`ops.assessment_explanations`** persist the exact JSON shapes from Section 7 (engine) and Section 9 (agent) respectively, keyed by `application_id`, append-only, so re-running an old `application_id` never overwrites history — this is what makes the audit trail in Section 1 real rather than aspirational.
+**`ops.assessment_results`** (implemented in Phase 3) and **`ops.assessment_explanations`** (Phase 4) persist the exact JSON shapes from Section 7 (engine) and Section 9 (agent) respectively, keyed by `application_id`, append-only, so re-running an old `application_id` never overwrites history — this is what makes the audit trail in Section 1 real rather than aspirational.
+
+**`ops.assessment_results`** — one row per engine run:
+
+| Column | Type |
+|---|---|
+| application_id | STRING |
+| policy_version | STRING |
+| eligibility_status | STRING |
+| rule_results | ARRAY<STRUCT<rule_id: STRING, metric: STRING, operator: STRING, status: STRING, actual_value: DOUBLE, required_value: DOUBLE>> |
+| exceptions | ARRAY<STRING> |
+| missing_information | ARRAY<STRING> |
+| assessed_at | TIMESTAMP |
 
 ### D.3 UC Functions (contract between data layer and both the engine and the agent)
 
@@ -368,14 +381,26 @@ All six are registered as Unity Catalog Functions so they are callable identical
 
 ### D.4 Deterministic Rules Engine — module design
 
-```
-RuleLoader.load(sector, as_of_date) -> List[Rule]          # from gold.policy_rules
-MetricCalculator.compute(application, borrower_360) -> Metrics   # dscr, ltv, exposure_ratio...
-PolicyEvaluator.evaluate(metrics, rules) -> List[RuleResult]     # pass/fail per rule, no side effects
-ResultBuilder.build(application, rule_results, missing_fields) -> AssessmentResult  # Section 7 JSON shape
+```python
+# engine/rule_loader.py — takes plain dicts, never touches Spark or the catalog itself
+select_applicable_rules(all_rules, applicable_sector, as_of_date) -> list[dict]
+resolve_headline_version(applicable_rules, applicable_sector) -> str
+
+# engine/metric_calculator.py
+compute_metrics(application, borrower) -> dict            # dscr, days_past_due, collateral_coverage_ratio
+
+# engine/policy_evaluator.py
+evaluate_rules(metrics, rules) -> list[dict]               # {rule_id, metric, operator, status, actual_value, required_value}
+
+# engine/result_builder.py
+build_result(application, rule_results, policy_version, missing_fields=None, hard_block=False, exceptions=None) -> dict  # Section 7 JSON shape
 ```
 
-Pure functions throughout — no network calls, no LLM calls, no randomness. `RuleLoader` is the *only* place `as_of_date` resolution logic lives, so the pre/post-circular behavior (Section 3's narrative hook) is implemented in exactly one function and is trivially unit-testable in isolation.
+Pure functions throughout — no network calls, no LLM calls, no randomness, and (implemented, not just aspired to) **no Spark dependency either**: every module takes and returns plain Python dicts/lists, so the entire golden test suite runs as ordinary `unittest` locally in under a second, with zero Databricks round-trips. `select_applicable_rules` is the *only* place `as_of_date`/supersession resolution logic lives — both the "which document version applies" question (Section 3's narrative hook) and the "future-effective rule not yet applicable" question (golden case 7) collapse to one function, unit-tested in isolation.
+
+`gold.policy_rules` doesn't carry a `version` column (that lives on `bronze.raw_policy_documents`) — the Databricks-side caller (`pipelines/run_assessment.py`) joins the two before handing rows to `select_applicable_rules`, so the engine itself never needs to know where `version` came from.
+
+**Eligibility-status precedence (the one piece of domain logic `result_builder.py` owns):** missing/unavailable required metric → `insufficient_information`; `hard_block=True` (wilful-defaulter signal from `check_repeat_offender_signals`) → `ineligible`, overriding every other metric; a failed `dscr` or `days_past_due` rule → `manual_review`; a failed `collateral_coverage_ratio` rule → `conditional`; otherwise → `eligible`. A bare CRILC flag (repeat-offender signal short of wilful-defaulter) deliberately does **not** change this status on its own — Section 8.2 treats it as a Key Risk Factor for the human reviewer and the Explanation/Advisory passes to weigh, not grounds for automatic engine-level rejection.
 
 ### D.5 LangGraph — state schema and node map
 

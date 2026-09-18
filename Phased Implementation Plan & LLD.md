@@ -20,8 +20,8 @@ flowchart TB
         subgraph UC[Unity Catalog: credit_platform]
             BRONZE[(bronze schema\nraw synthetic feeds)]
             SILVER[(silver schema\nvalidated/typed)]
-            GOLD[(gold schema\nborrower_360, policy_rules)]
-            POLVOL[(Volumes\npolicy_pdfs/)]
+            GOLD[(gold schema\nborrower_360, policy_rules,\ncommittee_memos)]
+            POLVOL[(Volumes\npolicy_pdfs/, committee_memos/)]
         end
 
         DLT[Delta Live Tables\npolicy ingestion pipeline]
@@ -30,7 +30,7 @@ flowchart TB
         VS[Vector Search\npolicy_chunks_index]
         FN[UC Functions\nget_borrower_financials etc.]
         ENGINE[Rules Engine\nDatabricks Notebook / Python wheel]
-        AGENT[LangGraph app\nDatabricks Model Serving or Driver notebook]
+        AGENT[LangGraph app — Explanation Pass +\nAdvisory Pass, run in parallel]
         MLF[MLflow Tracking + Tracing]
         APP[Optional: Databricks App / FastAPI\ncredit officer UI]
     end
@@ -84,11 +84,11 @@ Maps to Section 13, Phase 2.
 
 | | |
 |---|---|
-| **Goal** | Policy documents are parsed, versioned by effective date, chunked, embedded, and also distilled into a structured, machine-evaluable rules table |
-| **Tasks** | Author 3–5 dummy policy documents as PDFs (general SME credit policy, textile-sector policy v1, textile-sector policy v2/revised circular, one unrelated-sector policy as a negative-retrieval control); land them in the `policy_pdfs` Volume with metadata sidecar files; build a DLT pipeline: `ai_parse_document` → metadata extraction (`doc_type`, `effective_date`, `supersedes`, `applicable_sector`, `approval_status`) → chunking → human-validated structured rule extraction; create `gold.policy_chunks` and `gold.policy_rules`; build the Vector Search index over `policy_chunks`; implement UC Function `retrieve_policy` |
-| **Dummy data scope** | The pre/post-circular pair is mandatory: `POLICY-TEXTILE-01` (v1, effective 2026-01-01) and `POLICY-TEXTILE-01-v2` (effective 2026-09-01, supersedes v1, raises DSCR threshold) — this pair is what makes the Section 3 narrative hook work |
-| **Deliverable** | Working `retrieve_policy(query, sector, as_of_date)` that returns only the version effective as of `as_of_date`; `policy_rules` table with the DSCR-001-style structured rules |
-| **Exit criterion** | `retrieve_policy("DSCR threshold textile", as_of="2026-08-01")` returns v1; same call with `as_of="2026-09-15"` returns v2, and never both |
+| **Goal** | Policy documents are parsed, versioned by effective date, chunked, embedded, and also distilled into a structured, machine-evaluable rules table; a separate qualitative corpus (committee memos) is parsed and made available to the new Advisory Pass |
+| **Tasks** | Author 3–5 dummy policy documents as PDFs (general SME credit policy, textile-sector policy v1, textile-sector policy v2/revised circular, one unrelated-sector policy as a negative-retrieval control); land them in the `policy_pdfs` Volume with metadata sidecar files; build a DLT pipeline: `ai_parse_document` → metadata extraction (`doc_type`, `effective_date`, `supersedes`, `applicable_sector`, `approval_status`) → chunking → human-validated structured rule extraction; create `gold.policy_chunks` and `gold.policy_rules`; build the Vector Search index over `policy_chunks`; implement UC Function `retrieve_policy`. **New:** author 6–10 dummy credit-committee memos (short qualitative notes — sector commentary, promoter conduct observations, one memo referencing Meera Textiles) as PDFs/text, land them in `committee_memos/` Volume, parse via the same `ai_parse_document` step tagged `doc_type='committee_memo'`, and land the result in `gold.committee_memos` (no rule extraction, no vector index — the Advisory Pass reads these directly); implement UC Function `get_committee_memos` |
+| **Dummy data scope** | The pre/post-circular pair is mandatory: `POLICY-TEXTILE-01` (v1, effective 2026-01-01) and `POLICY-TEXTILE-01-v2` (effective 2026-09-01, supersedes v1, raises DSCR threshold) — this pair is what makes the Section 3 narrative hook work. For memos: at least one memo dated pre-circular with no qualitative concerns, and one dated post-circular noting softening sector export volumes — mirroring the two demo outputs in Section 9 |
+| **Deliverable** | Working `retrieve_policy(query, sector, as_of_date)` that returns only the version effective as of `as_of_date`; `policy_rules` table with the DSCR-001-style structured rules; working `get_committee_memos(sector, borrower_id)` returning memo text + date |
+| **Exit criterion** | `retrieve_policy("DSCR threshold textile", as_of="2026-08-01")` returns v1; same call with `as_of="2026-09-15"` returns v2, and never both. `get_committee_memos("textile_msme")` returns the seeded memos, most recent first |
 
 ### Phase 3 — Deterministic Rules Engine (3–5 days)
 
@@ -108,11 +108,11 @@ Maps to Section 13, Phase 4.
 
 | | |
 |---|---|
-| **Goal** | LangGraph state workflow that retrieves evidence and explains the engine's result — never recalculates it |
-| **Tasks** | Implement the state graph from Section 6 as LangGraph nodes; wrap each UC Function as a LangChain tool; write the synthesis prompt producing the 10-part output (Section 9); implement `ValidateResponse` as a numeric cross-check (every number in the LLM's explanation must match a value already present in `RESULT` or retrieved evidence — reject and loop back to `GenerateExplanation` on mismatch) |
-| **Dummy data scope** | No new data — this phase consumes Phase 1–3 outputs |
-| **Deliverable** | Running graph, invocable end-to-end with just `application_id`; produces the full 10-part assessment record |
-| **Exit criterion** | For MT-2026-0142, the agent's `Assessment Outcome` and `Key Risk Factors` sections cite only numbers traceable to `RESULT` or a retrieved policy chunk — zero invented figures across 10 sample runs |
+| **Goal** | LangGraph state workflow with two parallel passes off `EvaluatePolicyRules`: an **Explanation Pass** that grounds `RESULT` in evidence, and an **Advisory Pass** that reasons independently over full context — neither recalculates or overrides `RESULT` |
+| **Tasks** | Implement the state graph from Section 6 as LangGraph nodes, including the `RunAdvisoryPass → GenerateAdvisoryNotes` branch and the `SynthesizeAssessment` join; wrap each UC Function (including the new `get_committee_memos`) as a LangChain tool; write the Explanation synthesis prompt and a separate Advisory prompt producing the 11-part output (Section 9); implement `ValidateResponse` as a numeric cross-check on the Explanation Pass only (every number must match a value already present in `RESULT` or retrieved evidence — reject and loop back to `GenerateExplanation` on mismatch); enforce in the Advisory prompt/parser that its output is written only to the `AI Advisory Notes` field and never to `Assessment Outcome` |
+| **Dummy data scope** | No new data — this phase consumes Phase 1–3 outputs plus Phase 2's `committee_memos` |
+| **Deliverable** | Running graph, invocable end-to-end with just `application_id`; produces the full 11-part assessment record with Advisory Notes clearly labeled and separated from the deterministic outcome |
+| **Exit criterion** | For MT-2026-0142, the Explanation Pass's `Assessment Outcome` and `Key Risk Factors` cite only numbers traceable to `RESULT` or a retrieved policy chunk — zero invented figures across 10 sample runs; the Advisory Pass's output never contains an eligibility verdict (`Eligible`/`Conditional`/etc.) and `Assessment Outcome` is byte-identical to `RESULT.eligibility_status` regardless of what the Advisory Pass wrote |
 
 ### Phase 5 — Demo, Evaluation & Observability (3–4 days)
 
@@ -123,8 +123,8 @@ Maps to Section 13, Phase 5.
 | **Goal** | The pre/post-circular demo runs live, everything is traced, and the golden set has a pass/fail report |
 | **Tasks** | Wire MLflow Tracing across every LangGraph node and the rules engine call; build the pre/post-circular demo notebook (same question, run before and after ingesting policy v2); run the full golden set through the agent (not just the engine) and record retrieval/faithfulness/groundedness metrics per Section 11; optionally stand up a thin FastAPI or Databricks App front-end for the credit officer review step |
 | **Dummy data scope** | None new |
-| **Deliverable** | MLflow experiment with traced runs; a recorded before/after comparison matching Section 9's two demo outputs; an evaluation report against Section 11's metrics table |
-| **Exit criterion** | Demo notebook reproduces Section 9's exact before/after outcome change (`Eligible` → `Conditional`) end-to-end without manual intervention |
+| **Deliverable** | MLflow experiment with traced runs; a recorded before/after comparison matching Section 9's two demo outputs, including the differing Advisory Notes for each run; an evaluation report against Section 11's metrics table |
+| **Exit criterion** | Demo notebook reproduces Section 9's exact before/after outcome change (`Eligible` → `Conditional`) end-to-end without manual intervention, and the two runs' Advisory Notes differ (no-concern memo vs. softening-sector memo) while the eligibility outcome logic is driven solely by the rules engine |
 
 ### Phase 6 — Hardening & Stretch (optional, open-ended)
 
@@ -154,7 +154,9 @@ RAG-Project/
 │   ├── nodes.py                         # one function per state in Section 6
 │   ├── tools.py                         # LangChain wrappers over UC Functions
 │   ├── graph.py                         # graph assembly
-│   └── prompts/synthesis_prompt.md
+│   └── prompts/
+│       ├── explanation_prompt.md
+│       └── advisory_prompt.md
 ├── serving/
 │   └── app.py                           # optional FastAPI / Databricks App
 └── notebooks/
@@ -189,9 +191,10 @@ credit_platform (catalog)
 │   ├── borrower_360            (wide table, one row per borrower_id)
 │   ├── policy_chunks           (text + metadata, source for vector index)
 │   ├── policy_rules            (structured, source for rules engine)
+│   ├── committee_memos         (qualitative text, source for Advisory Pass only)
 │   └── applications
 ├── policy
-│   └── (Volume) policy_pdfs/{document_id}/{version}.pdf
+│   └── (Volume) policy_pdfs/{document_id}/{version}.pdf, committee_memos/{memo_id}.pdf
 └── ops
     ├── assessment_results      (engine output, append-only)
     ├── assessment_explanations (agent output, append-only)
@@ -246,6 +249,17 @@ credit_platform (catalog)
 | applicable_sector | STRING |
 | embedding | ARRAY<FLOAT> (managed by Vector Search) |
 
+**`gold.committee_memos`** (Advisory Pass source — no vector index, read directly by tool call)
+
+| Column | Type | Notes |
+|---|---|---|
+| memo_id | STRING (PK) | |
+| applicable_sector | STRING | e.g. `textile_msme` |
+| borrower_id | STRING NULL | set when a memo names a specific borrower |
+| memo_date | DATE | used for "most recent first" ordering |
+| memo_text | STRING | parsed, human-readable qualitative note |
+| source_document_id | STRING | |
+
 **`ops.assessment_results`** and **`ops.assessment_explanations`** persist the exact JSON shapes from Section 7 (engine) and Section 9 (agent) respectively, keyed by `application_id`, append-only, so re-running an old `application_id` never overwrites history — this is what makes the audit trail in Section 1 real rather than aspirational.
 
 ### D.3 UC Functions (contract between data layer and both the engine and the agent)
@@ -257,8 +271,9 @@ credit_platform (catalog)
 | `check_repeat_offender_signals` | `(borrower_id STRING) -> STRUCT` | `silver.crilc_records`, `silver.internal_product_history` |
 | `get_promoter_financials` | `(owner_ids ARRAY<STRING>) -> ARRAY<STRUCT>` | `silver.promoter_records` |
 | `retrieve_policy` | `(query STRING, applicable_sector STRING, as_of_date DATE) -> ARRAY<STRUCT>` | `gold.policy_chunks` via Vector Search index, filtered by `effective_date <= as_of_date` and no non-null `supersedes` pointing forward |
+| `get_committee_memos` | `(applicable_sector STRING, borrower_id STRING DEFAULT NULL) -> ARRAY<STRUCT>` | `gold.committee_memos`, ordered by `memo_date DESC`; **called only by the Advisory Pass**, never by the Explanation Pass or the rules engine |
 
-All five are registered as Unity Catalog Functions so they are callable identically from SQL, from the rules engine (Python), and as LangChain tools in the agent — one implementation, three callers.
+All six are registered as Unity Catalog Functions so they are callable identically from SQL, from the rules engine (Python), and as LangChain tools in the agent — one implementation, multiple callers. `get_committee_memos` is the one function the Explanation Pass and rules engine are never wired to call — that restriction is what keeps qualitative memo content out of the authoritative `RESULT` and `Assessment Outcome` fields.
 
 ### D.4 Deterministic Rules Engine — module design
 
@@ -282,11 +297,13 @@ class AssessmentState(TypedDict):
     engine_result: dict        # Section 7 output — set once, never mutated after
     retrieved_evidence: list[dict]
     draft_explanation: str
+    committee_memos: list[dict]     # from get_committee_memos, Advisory Pass only
+    advisory_notes: str              # Advisory Pass output — never eligibility-bearing
     validation_errors: list[str]
-    final_explanation: dict    # Section 9's 10-part record
+    final_assessment: dict     # Section 9's 11-part record
 ```
 
-Node-to-state-diagram mapping (Section 6 is authoritative for the flow; this is the implementation mapping):
+Node-to-state-diagram mapping (Section 6 is authoritative for the flow; this is the implementation mapping). The graph forks into two branches after `evaluate_policy_rules` and rejoins at `synthesize_assessment`:
 
 | Node function | Reads | Writes | Notes |
 |---|---|---|---|
@@ -295,16 +312,19 @@ Node-to-state-diagram mapping (Section 6 is authoritative for the flow; this is 
 | `validate_data` | `raw_inputs` | `missing_fields` | no tool calls, pure check |
 | `flag_missing_data` | `missing_fields` | `raw_inputs` (annotated) | never fabricates a value |
 | `resolve_policy` + `calculate_metrics` + `evaluate_policy_rules` | `raw_inputs` | `engine_result` | **calls the Phase-3 engine directly — not an LLM call** |
-| `retrieve_evidence` | `engine_result`, `borrower_id` | `retrieved_evidence` | calls `retrieve_policy` tool |
-| `generate_explanation` | `engine_result`, `retrieved_evidence` | `draft_explanation` | only LLM-generation step |
-| `validate_response` | `draft_explanation`, `engine_result` | `validation_errors` | regex/numeric cross-check against `engine_result` — loops back to `generate_explanation` on failure, per Section 6 |
-| `human_review` (terminal) | `final_explanation` | writes to `ops.decision_audit_log` | graph ends here |
+| *Explanation branch:* `retrieve_evidence` | `engine_result`, `borrower_id` | `retrieved_evidence` | calls `retrieve_policy` tool |
+| *Explanation branch:* `generate_explanation` | `engine_result`, `retrieved_evidence` | `draft_explanation` | LLM-generation step; grounded, restates `RESULT` |
+| *Advisory branch:* `run_advisory_pass` | `raw_inputs`, `borrower_id` | `committee_memos` | calls `get_committee_memos` tool; runs in parallel with the Explanation branch, **not gated on it** |
+| *Advisory branch:* `generate_advisory_notes` | `raw_inputs`, `committee_memos` | `advisory_notes` | LLM-generation step; prompt explicitly forbids stating or implying an eligibility verdict |
+| `synthesize_assessment` (join) | `draft_explanation`, `advisory_notes`, `engine_result` | `final_assessment` | assembles the 11-part record; `Assessment Outcome` is copied verbatim from `engine_result`, never from either LLM branch |
+| `validate_response` | `final_assessment`, `engine_result` | `validation_errors` | numeric cross-check on the Explanation content only, **and** a guard that rejects `advisory_notes` if it contains an eligibility-status token — loops back to `generate_explanation` on failure, per Section 6 |
+| `human_review` (terminal) | `final_assessment` | writes to `ops.decision_audit_log` | graph ends here |
 
-This table is the concrete reason the "LLM never decides" claim in Section 1 holds structurally: `engine_result` is written exactly once, by a non-LLM node, and every downstream node either reads it or is rejected by `validate_response`.
+This table is the concrete reason the "LLM never decides" claim in Section 1 holds structurally: `engine_result` is written exactly once, by a non-LLM node; `synthesize_assessment` copies its outcome field verbatim; and `validate_response` rejects any Advisory output that tries to smuggle in a competing verdict.
 
 ### D.6 Observability — MLflow tracing spans
 
-One MLflow run per `application_id` assessment, with nested spans: `retrieve_data` → `rules_engine` → `retrieve_evidence` → `generate_explanation` → `validate_response`. Tag every run with `policy_version` and `engine_result.eligibility_status` so the pre/post-circular demo is queryable directly from the MLflow UI (filter by `application_id = APP-001`, compare the two runs' `policy_version` tag).
+One MLflow run per `application_id` assessment, with nested spans: `retrieve_data` → `rules_engine` → [`retrieve_evidence` → `generate_explanation`] ‖ [`run_advisory_pass` → `generate_advisory_notes`] → `synthesize_assessment` → `validate_response` (the two bracketed spans run as sibling/parallel spans, not sequential). Tag every run with `policy_version` and `engine_result.eligibility_status` so the pre/post-circular demo is queryable directly from the MLflow UI (filter by `application_id = APP-001`, compare the two runs' `policy_version` tag and their differing `advisory_notes` span output).
 
 ### D.7 Sequence — one end-to-end assessment call
 
@@ -322,12 +342,21 @@ sequenceDiagram
     Data-->>Agent: raw_inputs
     Agent->>Eng: evaluate(raw_inputs, as_of_date)
     Eng-->>Agent: engine_result (deterministic)
-    Agent->>Pol: retrieve_policy(query, sector, as_of_date)
-    Pol-->>Agent: retrieved_evidence
-    Agent->>Agent: generate_explanation(engine_result, retrieved_evidence)
-    Agent->>Agent: validate_response (numeric cross-check)
-    Agent->>MLF: log trace + tags
-    Agent-->>RM: 10-part assessment record
+
+    par Explanation Pass
+        Agent->>Pol: retrieve_policy(query, sector, as_of_date)
+        Pol-->>Agent: retrieved_evidence
+        Agent->>Agent: generate_explanation(engine_result, retrieved_evidence)
+    and Advisory Pass
+        Agent->>Pol: get_committee_memos(sector, borrower_id)
+        Pol-->>Agent: committee_memos
+        Agent->>Agent: generate_advisory_notes(raw_inputs, committee_memos)
+    end
+
+    Agent->>Agent: synthesize_assessment (Assessment Outcome copied verbatim from engine_result)
+    Agent->>Agent: validate_response (numeric cross-check + advisory-verdict guard)
+    Agent->>MLF: log trace + tags (parallel spans)
+    Agent-->>RM: 11-part assessment record (incl. labeled AI Advisory Notes)
     RM->>Agent: record decision
     Agent->>Data: write ops.decision_audit_log
 ```
@@ -340,10 +369,10 @@ sequenceDiagram
 |---|---|---|---|
 | 0 | Workspace + repo | 1–2 days | UC catalog reachable from notebook + SQL warehouse |
 | 1 | Synthetic data layer | 3–5 days | `get_borrower_financials('MT-2026-0142')` matches Section 3 |
-| 2 | Policy intelligence | 4–6 days | `retrieve_policy` version-switches correctly across the circular date |
+| 2 | Policy intelligence + memos | 4–6 days | `retrieve_policy` version-switches correctly across the circular date; `get_committee_memos` returns seeded memos |
 | 3 | Deterministic engine | 3–5 days | All 10 golden cases pass, reproducibly |
-| 4 | Agent/orchestration | 4–6 days | Zero invented figures across 10 sample explanations |
-| 5 | Demo + observability | 3–4 days | Pre/post-circular demo reproduces Section 9's outcome flip |
+| 4 | Agent/orchestration (2-pass) | 4–6 days | Zero invented figures in Explanation Pass; Advisory Pass never emits an eligibility verdict |
+| 5 | Demo + observability | 3–4 days | Pre/post-circular demo reproduces Section 9's outcome flip and differing Advisory Notes |
 | 6 | Hardening (optional) | open | Backlog only, per Section 12 |
 
 **Total core build (Phases 0–5): ~3–4 weeks at a part-time, solo pace.**

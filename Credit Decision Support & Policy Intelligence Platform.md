@@ -79,9 +79,10 @@ flowchart TD
         E --> V[Databricks Vector Search]
         V --> UC5[UC Fn: retrieve_policy]
         E --> RULES[Structured policy rules table]
+        E --> MEMOS[Credit committee memos / qualitative text]
     end
 
-    subgraph ENGINE[Deterministic Layer — no LLM]
+    subgraph ENGINE[Deterministic Layer — authoritative]
         RULES --> RE[Credit Policy Evaluation Engine]
         UC1 --> RE
         UC2 --> RE
@@ -89,19 +90,25 @@ flowchart TD
         RE --> RESULT[Eligibility Result:\nEligible / Conditional / Manual Review /\nInsufficient Info + rule-level reasons]
     end
 
-    subgraph AGENT[LangGraph Orchestration]
-        RESULT --> AG[Explanation Workflow]
-        UC4 --> AG
-        UC5 --> AG
-        AG --> SYN[Synthesis: 10-part assessment]
+    subgraph AGENT[LangGraph — two subordinate passes, run in parallel]
+        UC4 --> EXP[Explanation Pass:\nexplains RESULT in evidence-backed language]
+        UC5 --> EXP
+        RESULT --> EXP
+        UC1 --> ADV[Advisory Pass:\nindependent qualitative read over\nfull borrower + memo + promoter context]
+        UC2 --> ADV
+        UC3 --> ADV
+        UC4 --> ADV
+        MEMOS --> ADV
+        EXP --> SYN[Synthesis: 11-part assessment]
+        ADV --> SYN
     end
 
     SYN --> REVIEW[Credit Officer Review]
     REVIEW --> AUDIT[Decision Audit Log]
-    AG --> MT[MLflow Tracing]
+    AGENT --> MT[MLflow Tracing]
 ```
 
-**Key design principle:** the Deterministic Layer calculates and decides; the LangGraph layer only retrieves evidence and explains that decision in language. The LLM never invents a threshold, never overrides `RESULT`, and never hides a missing-data exception.
+**Key design principle:** the Deterministic Layer alone produces `RESULT` — the eligibility outcome — and nothing downstream can override it. The LangGraph layer runs two clearly separated passes: an **Explanation Pass** that grounds `RESULT` in evidence, and an **Advisory Pass** that reasons independently over the full context to surface qualitative signals the rules engine can't see. Both feed the synthesis step, but only the Explanation Pass's account of `RESULT` is authoritative — the Advisory Pass is labeled, subordinate input for the human reviewer, never a competing verdict. Neither pass may invent or adjust a threshold, override `RESULT`, or hide a missing-data exception.
 
 ## 5. Policy Intelligence Pipeline
 
@@ -163,14 +170,18 @@ stateDiagram-v2
     ResolvePolicy --> CalculateMetrics
     CalculateMetrics --> EvaluatePolicyRules
     EvaluatePolicyRules --> RetrieveEvidence
+    EvaluatePolicyRules --> RunAdvisoryPass
     RetrieveEvidence --> GenerateExplanation
-    GenerateExplanation --> ValidateResponse
+    RunAdvisoryPass --> GenerateAdvisoryNotes
+    GenerateExplanation --> SynthesizeAssessment
+    GenerateAdvisoryNotes --> SynthesizeAssessment
+    SynthesizeAssessment --> ValidateResponse
     ValidateResponse --> GenerateExplanation: numeric mismatch
     ValidateResponse --> HumanReview: passes checks
     HumanReview --> [*]
 ```
 
-**Why LangGraph over a free-form agent:** credit decisions need explicit states, a controlled sequence, and a guaranteed human-review exit point. An open-ended tool-calling agent could skip validation or explain a result it invented; a state graph can't reach `HumanReview` without passing through `EvaluatePolicyRules` first.
+**Why LangGraph over a free-form agent:** credit decisions need explicit states, a controlled sequence, and a guaranteed human-review exit point. `RetrieveEvidence → GenerateExplanation` and `RunAdvisoryPass → GenerateAdvisoryNotes` run as two branches off the same `EvaluatePolicyRules` output — the Advisory branch reasons independently over the full borrower context, but neither branch can reach `HumanReview` without first passing through `EvaluatePolicyRules`, and only the Explanation branch is permitted to restate the eligibility outcome. An open-ended tool-calling agent could skip validation or explain a result it invented; this state graph can't.
 
 ## 7. Deterministic Credit Policy Evaluation Engine
 
@@ -209,15 +220,15 @@ The engine executes approved policy rules in plain Python/PySpark — no LLM inv
 
 ### Division of responsibility
 
-| Rules Engine (deterministic) | LangGraph + LLM |
-| --- | --- |
-| Loads approved policy rules | Interprets the RM's question |
-| Resolves the applicable policy version | Calls approved tools |
-| Calculates DSCR, LTV, exposure, etc. | Retrieves supporting evidence |
-| Evaluates rule pass/fail | Explains the rule results in plain language |
-| Returns a reproducible status | Surfaces risks and missing data |
+| Rules Engine (deterministic, authoritative) | LangGraph Explanation Pass | LangGraph Advisory Pass (parallel, subordinate) |
+| --- | --- | --- |
+| Loads approved policy rules | Interprets the RM's question | Reasons independently over full borrower, memo, and promoter context |
+| Resolves the applicable policy version | Calls approved tools | Flags qualitative concerns the rules engine can't encode |
+| Calculates DSCR, LTV, exposure, etc. | Retrieves supporting evidence | Surfaces patterns across memos, sector trends, promoter conduct |
+| Evaluates rule pass/fail — produces `RESULT` | Explains `RESULT` in plain language | Never restates or overrides `RESULT` |
+| Returns a reproducible status | Surfaces risks and missing data | Output is labeled "Advisory" and carries no eligibility weight |
 
-**The LLM must not:** invent or adjust a threshold, override a rule result, treat missing data as clean, or present an unverified source as authoritative. This separation is what makes the platform's output reproducible — rerunning the same application always returns the same eligibility status.
+**Neither LangGraph pass may:** invent or adjust a threshold, override `RESULT`, treat missing data as clean, or present an unverified source as authoritative. The Advisory Pass runs in parallel with full context and produces its own independent qualitative read — but its output is a labeled, clearly subordinate field, never a substitute for or a second vote against the deterministic eligibility status. This separation is what makes the platform's core output reproducible — rerunning the same application always returns the same `RESULT`, regardless of what the Advisory Pass says.
 
 ## 8. Extended Reasoning Layers
 
@@ -252,21 +263,22 @@ Every query returns a structured, audit-ready record:
 1. **Assessment Summary** — one-line verdict
 2. **Borrower Facts** — borrower ID, application ID, financial metrics, data freshness
 3. **Credit Metrics** — DSCR, exposure, requested amount, collateral, each with its source
-4. **Policy Evaluation** — rule-by-rule pass/fail from the deterministic engine, not the LLM
-5. **Key Risk Factors** — grounded in validated data and rule results
-6. **Mitigating Factors**
-7. **Missing Information** — evidence that's unavailable, stale, or unverified — never hidden or treated as clean
-8. **Policy and Regulatory Basis** — document, version, effective date, clause cited
-9. **Assessment Outcome** — Eligible / Ineligible / Conditional / Manual Review / Insufficient Information
-10. **Human Review** — reviewer, comments, final decision, override reason if applicable
+4. **Policy Evaluation** — rule-by-rule pass/fail from the deterministic engine, authoritative
+5. **Assessment Outcome** — Eligible / Ineligible / Conditional / Manual Review / Insufficient Information, taken directly from `RESULT` — unaffected by item 9
+6. **Key Risk Factors** — grounded in validated data and rule results
+7. **Mitigating Factors**
+8. **Missing Information** — evidence that's unavailable, stale, or unverified — never hidden or treated as clean
+9. **AI Advisory Notes** *(labeled, non-authoritative)* — the Advisory Pass's independent qualitative read over the full context (memos, promoter conduct, sector patterns) — flagged separately so a reviewer never mistakes it for the deterministic outcome
+10. **Policy and Regulatory Basis** — document, version, effective date, clause cited
+11. **Human Review** — reviewer, comments, final decision, override reason if applicable
 
 ### Demo output — before the circular update
 
-> **Outcome:** Eligible (standard terms) **Policy Basis:** RBI Textile Sector Circular, effective 2026-01-01
+> **Outcome:** Eligible (standard terms) **Policy Basis:** RBI Textile Sector Circular, effective 2026-01-01 **AI Advisory Notes:** No qualitative concerns flagged in recent committee memos; promoter has no exposure elsewhere on record.
 
 ### Demo output — after the circular update (same question)
 
-> **Outcome:** Conditional — additional collateral required **Policy Basis:** RBI Textile Sector Circular (Revised), effective 2026-09-01, supersedes prior version
+> **Outcome:** Conditional — additional collateral required **Policy Basis:** RBI Textile Sector Circular (Revised), effective 2026-09-01, supersedes prior version **AI Advisory Notes:** Sector-wide export order volumes softened in Q2 per recent memos — worth monitoring even though it doesn't affect the current rule outcome.
 
 The deterministic engine produced both outcomes; the LangGraph layer only explains each, citing the correct circular version.
 

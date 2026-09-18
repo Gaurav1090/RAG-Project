@@ -364,6 +364,8 @@ All monetary columns are `DOUBLE` in the actual implementation (not `DECIMAL`) �
 
 All six are registered as Unity Catalog Functions so they are callable identically from SQL, from the rules engine (Python), and as LangChain tools in the agent — one implementation, multiple callers. `get_committee_memos` is the one function the Explanation Pass and rules engine are never wired to call — that restriction is what keeps qualitative memo content out of the authoritative `RESULT` and `Assessment Outcome` fields.
 
+**Implementation note on `retrieve_policy`:** the `VECTOR_SEARCH` SQL table function on this workspace accepts only `index`, `query`/`query_text`, and `num_results` — passing a `filters` argument fails with `UNRECOGNIZED_PARAMETER_NAME` (confirmed by calling it directly). So `retrieve_policy` requests a wide candidate set (`num_results => 20`) unfiltered, then applies sector, effective-date, and non-superseded-document filtering in the wrapping SQL rather than pushing it into the vector search call itself. Verified live: querying "DSCR threshold textile" with `as_of_date` before 2026-09-01 returns only `POLICY-TEXTILE-01` (v1); the identical query with a date after that returns only `POLICY-TEXTILE-01-v2` — the pre/post-circular switch this whole design exists to demonstrate.
+
 ### D.4 Deterministic Rules Engine — module design
 
 ```

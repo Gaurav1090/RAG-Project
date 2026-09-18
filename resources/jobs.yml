@@ -23,8 +23,14 @@ resources:
         Authors the dummy policy PDFs + committee memos and uploads them to
         the policy Volumes, then parses them with ai_parse_document, chunks
         the policy text into gold.policy_chunks, builds gold.committee_memos,
-        and creates/syncs the Vector Search Delta Sync index over
-        gold.policy_chunks. Re-runnable.
+        creates/syncs the Vector Search Delta Sync index over
+        gold.policy_chunks, and registers retrieve_policy + get_committee_memos.
+        Re-runnable. Caveat on a fresh catalog's first run: a brand-new Vector
+        Search index can take 15-30 minutes to finish provisioning, so
+        register_policy_functions may fail the first time with the index not
+        yet ready — re-run just that task once
+        `databricks vector-search-indexes get-index <catalog>.gold.policy_chunks_index`
+        reports `"ready": true`.
       tasks:
         - task_key: generate_policy_documents
           notebook_task:
@@ -39,6 +45,13 @@ resources:
             base_parameters:
               catalog_name: ${var.catalog_name}
               vector_search_endpoint_name: ${var.vector_search_endpoint_name}
+        - task_key: register_policy_functions
+          depends_on:
+            - task_key: ingest_policy_and_memos
+          notebook_task:
+            notebook_path: ../data_generation/03_register_policy_functions.py
+            base_parameters:
+              catalog_name: ${var.catalog_name}
       tags:
         project: credit_platform
         environment: ${bundle.target}

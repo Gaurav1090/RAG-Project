@@ -77,6 +77,27 @@ resources:
         project: credit_platform
         environment: ${bundle.target}
 
+    phase4_agent_job:
+      name: ${bundle.target}_phase4_agent
+      description: >-
+        Runs the LangGraph agent (agent/) end to end for APP-001: Explanation
+        Pass + Advisory Pass in parallel off the Phase 3 engine result,
+        synthesized into the final assessment record and written to
+        ops.assessment_explanations. Installs only langgraph (databricks-
+        langchain's dependency tree doesn't resolve on this workspace - see
+        agent/tools.py:call_llm) and calls the model serving endpoint directly
+        via REST. Re-runnable — appends a new row each run.
+      tasks:
+        - task_key: run_agent_assessment
+          notebook_task:
+            notebook_path: ../pipelines/run_agent_assessment.py
+            base_parameters:
+              catalog_name: ${var.catalog_name}
+              application_id: APP-001
+      tags:
+        project: credit_platform
+        environment: ${bundle.target}
+
     phase1_foundation_job:
       name: ${bundle.target}_phase1_foundation
       description: >-

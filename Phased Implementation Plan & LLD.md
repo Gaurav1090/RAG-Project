@@ -110,10 +110,10 @@ Maps to Section 13, Phase 4.
 | | |
 |---|---|
 | **Goal** | LangGraph state workflow with two parallel passes off `EvaluatePolicyRules`: an **Explanation Pass** that grounds `RESULT` in evidence, and an **Advisory Pass** that reasons independently over full context — neither recalculates or overrides `RESULT` |
-| **Tasks** | Implement the state graph from Section 6 as LangGraph nodes, including the `RunAdvisoryPass → GenerateAdvisoryNotes` branch and the `SynthesizeAssessment` join; wrap each UC Function (including the new `get_committee_memos`) as a LangChain tool; write the Explanation synthesis prompt and a separate Advisory prompt producing the 11-part output (Section 9); implement `ValidateResponse` as a numeric cross-check on the Explanation Pass only (every number must match a value already present in `RESULT` or retrieved evidence — reject and loop back to `GenerateExplanation` on mismatch); enforce in the Advisory prompt/parser that its output is written only to the `AI Advisory Notes` field and never to `Assessment Outcome` |
+| **Tasks** | `agent/state.py`, `nodes.py`, `graph.py`: the Section 6 state graph as LangGraph nodes, including the `RunAdvisoryPass → GenerateAdvisoryNotes` branch and the `SynthesizeAssessment` join; `agent/prompts/`: the Explanation and Advisory prompt templates; `pipelines/run_agent_assessment.py`: the Databricks-side runner. `ValidateResponse` is a numeric cross-check on the Explanation Pass (every decimal number in the draft must match a value already in `RESULT.rule_results` or a retrieved chunk's text — reject and loop back to `GenerateExplanation`, capped at 3 attempts) plus an eligibility-token guard on the Advisory Pass output (rejects if it contains any of "eligible/ineligible/conditional/manual review/insufficient information/approved/rejected/declined"). **Real dependency substitution:** `databricks-langchain` — the documented "wrap as a LangChain tool" route — pulls in `databricks-openai` → `openai-agents`, whose dependency tree pip's resolver could not finish on this workspace (`ResolutionTooDeep`, confirmed by installing each package individually). `langgraph` and plain `langchain` both install cleanly on their own, so the two LLM calls go through a direct REST call to the model serving endpoint (`agent/tools.py:call_llm`, the same OpenAI-compatible `/serving-endpoints/<name>/invocations` schema `ChatDatabricks` would have used internally) instead of a LangChain chat-model wrapper. The UC Functions are still wrapped as plain Python functions in `agent/tools.py`, called directly by graph nodes rather than via LLM tool-calling — consistent with Section 6's "controlled state graph, not an open-ended agent": the graph's edges decide when each one runs, never a model's discretion |
 | **Dummy data scope** | No new data — this phase consumes Phase 1–3 outputs plus Phase 2's `committee_memos` |
-| **Deliverable** | Running graph, invocable end-to-end with just `application_id`; produces the full 11-part assessment record with Advisory Notes clearly labeled and separated from the deterministic outcome |
-| **Exit criterion** | For MT-2026-0142, the Explanation Pass's `Assessment Outcome` and `Key Risk Factors` cite only numbers traceable to `RESULT` or a retrieved policy chunk — zero invented figures across 10 sample runs; the Advisory Pass's output never contains an eligibility verdict (`Eligible`/`Conditional`/etc.) and `Assessment Outcome` is byte-identical to `RESULT.eligibility_status` regardless of what the Advisory Pass wrote |
+| **Deliverable** | Running graph, invocable end-to-end with just `application_id`; produces the assessment record with Advisory Notes clearly labeled and separated from the deterministic outcome; persisted to a new `ops.assessment_explanations` table |
+| **Exit criterion** | Verified live for APP-001 in both dev and prod: `assessment_outcome` is byte-identical to the engine's `eligibility_status` ("manual_review") regardless of what either LLM branch wrote; the Advisory Pass's output contains zero eligibility-status tokens; the numeric cross-check actually exercised its retry path in practice (first attempt rejected an unverified number, second attempt passed cleanly) rather than trivially passing on the first try |
 
 ### Phase 5 — Demo, Evaluation & Observability (3–4 days)
 
@@ -147,6 +147,7 @@ RAG-Project/
 ├── pipelines/
 │   ├── policy_ingestion.py              # ai_parse_document -> chunk -> gold.policy_chunks/committee_memos + VS index
 │   ├── run_assessment.py                # wires engine/ to live catalog data, writes ops.assessment_results
+│   ├── run_agent_assessment.py          # wires agent/ to live data, writes ops.assessment_explanations
 │   └── data_refresh_job.py              # scheduled bronze->silver->gold refresh
 ├── engine/                               # pure Python, no Spark/Databricks dependency
 │   ├── rule_loader.py
@@ -156,8 +157,8 @@ RAG-Project/
 │   └── tests/test_golden_cases.py       # `python3 -m unittest engine.tests.test_golden_cases`
 ├── agent/
 │   ├── state.py                         # LangGraph state schema
-│   ├── nodes.py                         # one function per state in Section 6
-│   ├── tools.py                         # LangChain wrappers over UC Functions
+│   ├── nodes.py                         # one function per state in Section 6, + numeric cross-check / advisory guard
+│   ├── tools.py                         # plain wrappers over UC Functions + direct-REST LLM call
 │   ├── graph.py                         # graph assembly
 │   └── prompts/
 │       ├── explanation_prompt.md
@@ -364,6 +365,17 @@ All monetary columns are `DOUBLE` in the actual implementation (not `DECIMAL`) �
 | missing_information | ARRAY<STRING> |
 | assessed_at | TIMESTAMP |
 
+**`ops.assessment_explanations`** — one row per agent run. The full assessment record is stored as a JSON string (`final_assessment_json`) rather than a native nested column — its shape (narrative text, advisory notes, structured sub-objects) is still evolving through Phase 5, and a JSON blob avoids a schema migration every time that shape changes. `assessment_outcome` is broken out as its own column specifically so it's trivially queryable/joinable against `ops.assessment_results.eligibility_status` to verify they always match, without parsing JSON:
+
+| Column | Type |
+|---|---|
+| application_id | STRING |
+| assessment_outcome | STRING — copied verbatim from `ops.assessment_results`, never independently derived |
+| final_assessment_json | STRING |
+| validation_errors_json | STRING |
+| explanation_attempts | INT |
+| assessed_at | TIMESTAMP |
+
 ### D.3 UC Functions (contract between data layer and both the engine and the agent)
 
 | Function | Signature | Backing table(s) |
@@ -437,6 +449,8 @@ Node-to-state-diagram mapping (Section 6 is authoritative for the flow; this is 
 | `human_review` (terminal) | `final_assessment` | writes to `ops.decision_audit_log` | graph ends here |
 
 This table is the concrete reason the "LLM never decides" claim in Section 1 holds structurally: `engine_result` is written exactly once, by a non-LLM node; `synthesize_assessment` copies its outcome field verbatim; and `validate_response` rejects any Advisory output that tries to smuggle in a competing verdict.
+
+**Implementation notes:** the `generate_explanation ↔ validate_response` retry loop is capped at `MAX_EXPLANATION_ATTEMPTS = 3` (`agent/nodes.py`) — Section 6's diagram shows the loop but doesn't bound it, and an ungrounded model could otherwise retry forever. `resolve_policy`/`calculate_metrics`/`evaluate_policy_rules` collapse into a single `evaluate_policy_rules` node in the actual graph (one Python function calling the three Phase 3 engine functions in sequence — no state needs to round-trip through the graph between them). Verified live for APP-001: the retry loop isn't just theoretical — the first `generate_explanation` attempt was rejected by the numeric cross-check, the second passed cleanly, and `assessment_outcome` came back byte-identical to the engine's `eligibility_status` ("manual_review") in both dev and prod.
 
 ### D.6 Observability — MLflow tracing spans
 

@@ -78,12 +78,13 @@ RETURN (
 spark.sql(f"""
 CREATE OR REPLACE FUNCTION {CATALOG}.gold.get_committee_memos(
     p_applicable_sector STRING,
-    p_borrower_id STRING DEFAULT NULL
+    p_borrower_id STRING DEFAULT NULL,
+    p_as_of_date DATE DEFAULT NULL
 )
 RETURNS ARRAY<STRUCT<
     memo_id: STRING, applicable_sector: STRING, borrower_id: STRING, memo_date: DATE, memo_text: STRING
 >>
-COMMENT 'Committee memos for a sector (and optionally a specific borrower), most recent first. Advisory Pass only — never called by the Explanation Pass or the rules engine.'
+COMMENT 'Committee memos for a sector (and optionally a specific borrower), most recent first, optionally as-of a date. Advisory Pass only — never called by the Explanation Pass or the rules engine.'
 RETURN (
     SELECT array_sort(
         collect_list(named_struct(
@@ -97,6 +98,7 @@ RETURN (
     FROM {CATALOG}.gold.committee_memos
     WHERE applicable_sector = p_applicable_sector
       AND (p_borrower_id IS NULL OR borrower_id = p_borrower_id OR borrower_id IS NULL)
+      AND (p_as_of_date IS NULL OR memo_date <= p_as_of_date)
 )
 """)
 

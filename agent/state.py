@@ -3,13 +3,16 @@
 `total=False` since every field is populated incrementally as the graph progresses; a field
 missing simply means that node hasn't run yet.
 
-Two fields exist here that Part D.5's original sketch didn't name explicitly, added during
+Fields here that Part D.5's original sketch didn't name explicitly, added during
 implementation because the graph genuinely needs them:
 - `application` / `as_of_date`: the application-level facts `identify_application` fetches
   (requested_loan_amount, assessment_date) — the engine needs these alongside the borrower.
 - `_explanation_attempts`: bounds the `ValidateResponse -> GenerateExplanation` retry loop
   (Section 6's diagram shows the loop but doesn't cap it; an uncapped retry against a model
   that keeps citing an ungrounded number would loop forever).
+- `as_of_date_override`: an optional input (never written by a node) letting Phase 5's
+  pre/post-circular demo ask the identical question as of two different dates without
+  seeding two separate application rows for the same reference scenario.
 """
 
 from typing import Any, TypedDict
@@ -17,6 +20,7 @@ from typing import Any, TypedDict
 
 class AssessmentState(TypedDict, total=False):
     application_id: str
+    as_of_date_override: Any  # datetime.date, optional input only
     borrower_id: str
     application: dict[str, Any]
     as_of_date: Any  # datetime.date

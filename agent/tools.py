@@ -68,10 +68,11 @@ def retrieve_policy(spark, catalog, query, applicable_sector, as_of_date):
     return [r.asDict() for r in rows] if rows else []
 
 
-def get_committee_memos(spark, catalog, applicable_sector, borrower_id=None):
+def get_committee_memos(spark, catalog, applicable_sector, borrower_id=None, as_of_date=None):
     borrower_literal = f"'{sql_escape(borrower_id)}'" if borrower_id else "NULL"
+    as_of_literal = f"DATE'{as_of_date}'" if as_of_date else "NULL"
     rows = spark.sql(f"""
-        SELECT {catalog}.gold.get_committee_memos('{sql_escape(applicable_sector)}', {borrower_literal}) AS r
+        SELECT {catalog}.gold.get_committee_memos('{sql_escape(applicable_sector)}', {borrower_literal}, {as_of_literal}) AS r
     """).collect()[0]["r"]
     return [r.asDict() for r in rows] if rows else []
 

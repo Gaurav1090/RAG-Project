@@ -98,6 +98,31 @@ resources:
         project: credit_platform
         environment: ${bundle.target}
 
+    phase5_demo_and_eval_job:
+      name: ${bundle.target}_phase5_demo_and_eval
+      description: >-
+        Runs the pre/post-circular centerpiece demo (same application, before
+        and after the RBI textile circular's revision, asserting the
+        eligible -> manual_review flip and that the Advisory Pass only sees
+        the September committee memo in the "after" run) and the golden-set
+        evaluation (10 engine cases + agent-level metrics for the centerpiece
+        case), both traced to MLflow under
+        /Users/<you>/credit_platform_assessments. Re-runnable.
+      tasks:
+        - task_key: demo_pre_post_circular
+          notebook_task:
+            notebook_path: ../notebooks/02_demo_pre_post_circular.py
+            base_parameters:
+              catalog_name: ${var.catalog_name}
+        - task_key: run_golden_set_eval
+          notebook_task:
+            notebook_path: ../notebooks/03_run_golden_set_eval.py
+            base_parameters:
+              catalog_name: ${var.catalog_name}
+      tags:
+        project: credit_platform
+        environment: ${bundle.target}
+
     phase1_foundation_job:
       name: ${bundle.target}_phase1_foundation
       description: >-

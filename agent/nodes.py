@@ -10,6 +10,8 @@ import json
 import re
 from datetime import datetime, timezone
 
+import mlflow
+
 from engine.metric_calculator import compute_metrics
 from engine.policy_evaluator import evaluate_rules
 from engine.result_builder import build_result
@@ -63,6 +65,7 @@ def build_nodes(spark, catalog, workspace_url, token, prompts_dir):
     explanation_template = _load_prompt("explanation_prompt.md")
     advisory_template = _load_prompt("advisory_prompt.md")
 
+    @mlflow.trace(name="identify_application")
     def identify_application(state):
         row = spark.sql(f"""
             SELECT application_id, borrower_id, product, assessment_date, requested_loan_amount
@@ -75,9 +78,13 @@ def build_nodes(spark, catalog, workspace_url, token, prompts_dir):
                 "application_id": row["application_id"],
                 "requested_loan_amount": row["requested_loan_amount"],
             },
-            "as_of_date": row["assessment_date"],
+            # Phase 5's pre/post-circular demo needs to ask the identical question as of two
+            # different dates without seeding two separate application rows — an optional
+            # override, defaulting to the application's own stored assessment_date.
+            "as_of_date": state.get("as_of_date_override") or row["assessment_date"],
         }
 
+    @mlflow.trace(name="retrieve_data")
     def retrieve_data(state):
         borrower_id = state["borrower_id"]
         borrower = tools.get_borrower_financials(spark, catalog, borrower_id)
@@ -90,6 +97,7 @@ def build_nodes(spark, catalog, workspace_url, token, prompts_dir):
             "repeat_offender": repeat_offender, "promoters": promoters,
         }}
 
+    @mlflow.trace(name="validate_data")
     def validate_data(state):
         borrower = state["raw_inputs"]["borrower"]
         missing = []
@@ -99,12 +107,14 @@ def build_nodes(spark, catalog, workspace_url, token, prompts_dir):
             missing.append("Borrower DSCR / financial statement")
         return {"missing_fields": missing}
 
+    @mlflow.trace(name="flag_missing_data")
     def flag_missing_data(state):
         # Explicit no-op state so the graph's shape matches Section 6 exactly
         # (ValidateData -> FlagMissingData -> ResolvePolicy) — validate_data already computed
         # missing_fields; nothing further to annotate.
         return {}
 
+    @mlflow.trace(name="rules_engine")
     def evaluate_policy_rules(state):
         borrower = state["raw_inputs"]["borrower"]
         application = state["application"]
@@ -132,12 +142,14 @@ def build_nodes(spark, catalog, workspace_url, token, prompts_dir):
         )
         return {"engine_result": engine_result}
 
+    @mlflow.trace(name="retrieve_evidence")
     def retrieve_evidence(state):
         borrower = state["raw_inputs"]["borrower"]
         query = f"policy rules for {borrower['sector']} DSCR collateral coverage days past due"
         evidence = tools.retrieve_policy(spark, catalog, query, borrower["sector"], state["as_of_date"])
         return {"retrieved_evidence": evidence}
 
+    @mlflow.trace(name="generate_explanation")
     def generate_explanation(state):
         engine_result = state["engine_result"]
         validation_feedback = ""
@@ -159,11 +171,15 @@ def build_nodes(spark, catalog, workspace_url, token, prompts_dir):
             "_explanation_attempts": state.get("_explanation_attempts", 0) + 1,
         }
 
+    @mlflow.trace(name="run_advisory_pass")
     def run_advisory_pass(state):
         borrower = state["raw_inputs"]["borrower"]
-        memos = tools.get_committee_memos(spark, catalog, borrower["sector"], state["borrower_id"])
+        memos = tools.get_committee_memos(
+            spark, catalog, borrower["sector"], state["borrower_id"], state["as_of_date"],
+        )
         return {"committee_memos": memos}
 
+    @mlflow.trace(name="generate_advisory_notes")
     def generate_advisory_notes(state):
         prompt = advisory_template.format(
             borrower=json.dumps(state["raw_inputs"]["borrower"], default=str),
@@ -173,6 +189,7 @@ def build_nodes(spark, catalog, workspace_url, token, prompts_dir):
         notes = tools.call_llm(workspace_url, token, [{"role": "user", "content": prompt}])
         return {"advisory_notes": notes}
 
+    @mlflow.trace(name="synthesize_assessment")
     def synthesize_assessment(state):
         engine_result = state["engine_result"]
         final_assessment = {
@@ -198,6 +215,7 @@ def build_nodes(spark, catalog, workspace_url, token, prompts_dir):
         }
         return {"final_assessment": final_assessment}
 
+    @mlflow.trace(name="validate_response")
     def validate_response(state):
         errors = _numeric_cross_check(
             state.get("draft_explanation", ""), state["engine_result"], state.get("retrieved_evidence", []),
@@ -205,6 +223,7 @@ def build_nodes(spark, catalog, workspace_url, token, prompts_dir):
         errors += _advisory_verdict_guard(state.get("advisory_notes", ""))
         return {"validation_errors": errors}
 
+    @mlflow.trace(name="human_review")
     def human_review(state):
         spark.sql(f"""
             CREATE TABLE IF NOT EXISTS {catalog}.ops.decision_audit_log (
